@@ -2,7 +2,7 @@
 
 #include "../includes.hpp"
 
-class RenderSettingsLayer : public geode::Popup<>, public TextInputDelegate {
+class RenderSettingsLayer : public geode::Popup, public TextInputDelegate {
 	
 public:
 
@@ -24,7 +24,7 @@ public:
 
 private:
 
-	bool setup() override;
+	bool setup();
 
 public:
 

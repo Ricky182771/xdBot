@@ -2,6 +2,7 @@ src2/
 build/
 build-android32/
 build-android64/
+CLAUDE.md
 
 test.txt
 test.cpp

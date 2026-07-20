@@ -3,10 +3,6 @@
 
 #include <Geode/modify/CCTextInputNode.hpp>
 
-#ifdef GEODE_IS_WINDOWS
-#include <geode.custom-keybinds/include/Keybinds.hpp>
-#endif
-
 #include <random>
 
 class $modify(CCTextInputNode) {
@@ -188,20 +184,16 @@ int Global::getCurrentFrame(bool editor) {
 void Global::updateKeybinds() {
 #ifdef GEODE_IS_WINDOWS
 
-  auto& g = Global::get();
-  for (size_t i = 0; i < 6; i++) {
-    auto keys = keybinds::BindManager::get()->getBindsFor(buttonIDs[i]);
-    std::vector<int> keysInts = {};
+  // TODO(port-v5): This used geode.custom-keybinds' BindManager::getBindsFor()
+  // to read the physical keys the player has bound to RobTop's own gameplay
+  // actions ("robtop.geometry-dash/jump-p1", etc.), so that dispatchKeyboardMSG
+  // could track manually-held gameplay buttons (g.heldButtons / g.keybinds).
+  // Geode v5 removed custom-keybinds and exposes no native equivalent for
+  // reading GD's own key bindings. This needs to be re-implemented (e.g. by
+  // reading GD's control settings directly) once the new source is identified.
+  // Left as a no-op for now so manual-input detection is temporarily degraded
+  // rather than crashing.
 
-    for (size_t j = 0; j < keys.size(); j++) {
-      keysInts.push_back(keys[j]->getHash());
-      g.allKeybinds.insert(keys[j]->getHash());
-    }
-
-    g.keybinds[i].clear();
-    for (int k = 0; k < keysInts.size(); k++)
-      g.keybinds[i].push_back(keysInts[k]);
-  }
 #endif
 }
 
@@ -335,8 +327,7 @@ void Global::frameStepperOff() {
 
 PauseLayer* Global::getPauseLayer() {
   CCArray* children = CCDirector::sharedDirector()->getRunningScene()->getChildren();
-  CCObject* child;
-  CCARRAY_FOREACH(children, child) {
+  for (CCObject* child : CCArrayExt<CCObject*>(children)) {
     if (PauseLayer* pauseLayer = typeinfo_cast<PauseLayer*>(child))
       return pauseLayer;
   }

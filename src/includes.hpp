@@ -15,6 +15,10 @@
 
 using namespace geode::prelude;
 
+// TODO(port-v5): This is the GD 2.2074 (Windows) offset of the global RNG seed,
+// used in Global::updateSeed via geode::base::get() + seedAddr. It MUST be
+// re-found for GD 2.2081 against the new binary — the current value is wrong for
+// 2.208x and will corrupt memory / produce incorrect seeds if used unchanged.
 const int seedAddr = 0x6a4e20;
 
 const int indexButton[6] = { 1, 2, 3, 1, 2, 3 };
@@ -32,10 +36,13 @@ const std::string buttonIDs[6] = {
     "robtop.geometry-dash/move-right-p2"
 };
 
+// Geode v5: geode::Popup is no longer templated and has no setup() hook.
+// initAnchored(w, h, ...) was replaced by Popup::init(w, h, bg, bgRect).
+// We call the base init ourselves and then run the class's own setup().
 #define STATIC_CREATE(class, width, height) \
     static class* create() { \
         class* ret = new class(); \
-        if (ret->initAnchored(width, height, Utils::getTexture().c_str())) { \
+        if (ret->geode::Popup::init(width, height, Utils::getTexture().c_str()) && ret->setup()) { \
             ret->autorelease(); \
             return ret; \
         } \
@@ -79,7 +86,7 @@ public:
     static PauseLayer* getPauseLayer();
 
     Mod* mod = Mod::get();
-    geode::Popup<>* layer = nullptr;
+    geode::Popup* layer = nullptr;
 
     Macro macro;
     Renderer renderer;

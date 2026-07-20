@@ -15,7 +15,9 @@ public:
 
     static std::string getSimplifiedString(std::string str);
 
-    static void setBackgroundColor(cocos2d::extension::CCScale9Sprite* bg);
+    // Geode v5: Popup::m_bgSprite is now a geode::NineSlice (CCNodeRGBA), not a
+    // CCScale9Sprite. CCNodeRGBA is the common base that also covers CCScale9Sprite.
+    static void setBackgroundColor(cocos2d::CCNodeRGBA* bg);
 
     static std::vector<std::string> splitByChar(std::string str, char splitChar);
 

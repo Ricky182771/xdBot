@@ -1,11 +1,11 @@
 #include "../includes.hpp"
 #include "record_layer.hpp"
 
-class MirrorSettingsLayer : public geode::Popup<> {
+class MirrorSettingsLayer : public geode::Popup {
 
 private:
 	
-    bool setup() override {
+    bool setup() {
         setTitle("Input Mirror");
 		
 		cocos2d::CCPoint offset = (CCDirector::sharedDirector()->getWinSize() - m_mainLayer->getContentSize()) / 2;

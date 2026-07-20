@@ -1,23 +1,87 @@
 {
-	"geode": "4.4.0",
+	"geode": "5.8.2",
 	"gd": {
-		"win": "2.2074",
-		"android": "2.2074"
+		"win": "2.2081",
+		"android": "2.2081"
 	},
 	"version": "2.4.1",
 	"id": "zilko.xdbot",
 	"name": "xdBot",
 	"developer": "Zilko",
 	"description": "Best Free Bot fr",
-	"dependencies": [
-		{
-			"id": "geode.custom-keybinds",
-			"version": ">=v1.10.0",
-			"importance": "required",
-			"platforms": ["win"]
-		}
-	],
 	"settings": {
+		"open_menu": {
+			"name": "Open Menu",
+			"description": "Opens the xdBot menu.",
+			"type": "keybind",
+			"default": "Alt+F",
+			"platforms": ["win"],
+			"migrate-from": "zilko.xdbot/open_menu"
+		},
+		"toggle_recording": {
+			"name": "Record macro",
+			"description": "Toggles recording.",
+			"type": "keybind",
+			"default": "Alt+G",
+			"platforms": ["win"],
+			"migrate-from": "zilko.xdbot/toggle_recording"
+		},
+		"toggle_playing": {
+			"name": "Play macro",
+			"description": "Toggles playing.",
+			"type": "keybind",
+			"default": "Alt+H",
+			"platforms": ["win"],
+			"migrate-from": "zilko.xdbot/toggle_playing"
+		},
+		"toggle_speedhack": {
+			"name": "Speedhack",
+			"description": "Toggles speedhack.",
+			"type": "keybind",
+			"default": "Alt+S",
+			"platforms": ["win"],
+			"migrate-from": "zilko.xdbot/toggle_speedhack"
+		},
+		"toggle_noclip": {
+			"name": "NoClip",
+			"description": "Toggles NoClip.",
+			"type": "keybind",
+			"default": "Alt+N",
+			"platforms": ["win"],
+			"migrate-from": "zilko.xdbot/toggle_noclip"
+		},
+		"toggle_frame_stepper": {
+			"name": "Toggle Frame Stepper",
+			"description": "Toggles frame stepper.",
+			"type": "keybind",
+			"default": "Alt+C",
+			"platforms": ["win"],
+			"migrate-from": "zilko.xdbot/toggle_frame_stepper"
+		},
+		"step_frame": {
+			"name": "Advance frame",
+			"description": "Advances one frame if frame stepper is on.",
+			"type": "keybind",
+			"default": "V",
+			"platforms": ["win"],
+			"migrate-from": "zilko.xdbot/step_frame"
+		},
+		"show_trajectory": {
+			"name": "Show Trajectory",
+			"description": "Toggles Show Trajectory.",
+			"type": "keybind",
+			"default": "Alt+T",
+			"platforms": ["win"],
+			"migrate-from": "zilko.xdbot/show_trajectory"
+		},
+		"toggle_render": {
+			"name": "Render",
+			"description": "Toggles rendering.",
+			"type": "keybind",
+			"default": "Alt+P",
+			"platforms": ["win"],
+			"migrate-from": "zilko.xdbot/toggle_render"
+		},
 		"button-setting": {
 			"type": "custom:button",
 			"name": "Open Menu"

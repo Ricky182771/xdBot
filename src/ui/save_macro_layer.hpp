@@ -1,7 +1,7 @@
 #pragma once
 #include "../includes.hpp"
 
-class SaveMacroLayer : public geode::Popup<> {
+class SaveMacroLayer : public geode::Popup {
 
     TextInput* authorInput = nullptr;
     TextInput* descInput = nullptr;
@@ -11,7 +11,7 @@ class SaveMacroLayer : public geode::Popup<> {
 
 private:
 
-    bool setup() override {
+    bool setup() {
         Utils::setBackgroundColor(m_bgSprite);
 
         setTitle("Save Macro");

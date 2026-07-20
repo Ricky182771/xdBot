@@ -1,29 +1,21 @@
 #include "macro_editor.hpp"
 #include "record_layer.hpp"
 
-#include <Geode/modify/CCEGLView.hpp>
 #include <Geode/modify/FLAlertLayer.hpp>
 
 MacroEditLayer* editLayer = nullptr;
 
 #ifdef GEODE_IS_WINDOWS
 
-class $modify(CCEGLView) {
-    void onGLFWMouseMoveCallBack(GLFWwindow* v1, double v2, double v3) {
-        CCEGLView::onGLFWMouseMoveCallBack(v1, v2, v3);
+// Replaces the old CCEGLView::onGLFWMouseMoveCallBack hook (no longer hookable
+// in Geode v5 / GD 2.2081 because it's inline). Polls the mouse each frame.
+void MacroEditLayer::update(float dt) {
+    updateHover(getMousePos());
+}
 
-        if (!editLayer) return;
+#else
 
-        CCScene* scene = CCDirector::get()->getRunningScene();
-        if (MacroEditLayer* layer = scene->getChildByType<MacroEditLayer>(0))
-            editLayer = layer;
-        else
-            return;
-
-        editLayer->updateHover(getMousePos());
-        
-    }
-};
+void MacroEditLayer::update(float dt) {}
 
 #endif
 
@@ -115,7 +107,12 @@ void MacroEditLayer::updateHover(cocos2d::CCPoint pos) {
 
 bool MacroEditLayer::setup() {
     Utils::setBackgroundColor(m_bgSprite);
-    
+
+#ifdef GEODE_IS_WINDOWS
+    // Drive hover updates (see MacroEditLayer::update).
+    this->scheduleUpdate();
+#endif
+
     CCMenu* menu = CCMenu::create();
     menu->setID("main-menu");
     m_mainLayer->addChild(menu);
@@ -887,10 +884,9 @@ void MacroEditLayer::onSave(CCObject*) {
             onClose(nullptr);
 
             CCArray* children = CCDirector::sharedDirector()->getRunningScene()->getChildren();
-            CCObject* child;
-            CCARRAY_FOREACH(children, child) {
+            for (CCObject* child : CCArrayExt<CCObject*>(children)) {
                 if (RecordLayer* layer = typeinfo_cast<RecordLayer*>(child)) {
-                    layer->keyBackClicked();
+                    layer->onClose(nullptr);
                     break;
                 }
             }
@@ -900,8 +896,7 @@ void MacroEditLayer::onSave(CCObject*) {
 
             Loader::get()->queueInMainThread([] {
                 CCArray* children = CCDirector::sharedDirector()->getRunningScene()->getChildren();
-                CCObject* child;
-                CCARRAY_FOREACH(children, child) {
+                for (CCObject* child : CCArrayExt<CCObject*>(children)) {
                     if (MacroEditLayer* layer = typeinfo_cast<MacroEditLayer*>(child)) {
                         editLayer = layer;
                         break;
@@ -953,15 +948,14 @@ void MacroEditLayer::onClear(CCObject*) {
 }
 
 void MacroEditLayer::onMerge(CCObject*) {
-    geode::Popup<>* layer = nullptr;
+    geode::Popup* layer = nullptr;
     if (Global::get().layer)
-        layer = typeinfo_cast<geode::Popup<>*>(Global::get().layer);
+        layer = typeinfo_cast<geode::Popup*>(Global::get().layer);
     else {
         CCArray* children = CCDirector::sharedDirector()->getRunningScene()->getChildren();
-        CCObject* child;
-        CCARRAY_FOREACH(children, child) {
+        for (CCObject* child : CCArrayExt<CCObject*>(children)) {
             if (typeinfo_cast<RecordLayer*>(child)) {
-                layer = typeinfo_cast<geode::Popup<>*>(child);
+                layer = typeinfo_cast<geode::Popup*>(child);
                 break;
             }
         }

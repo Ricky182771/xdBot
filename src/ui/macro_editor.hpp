@@ -11,7 +11,7 @@ struct InputText {
     std::string action;
 };
 
-class MacroEditLayer : public geode::Popup<>, public TextInputDelegate {
+class MacroEditLayer : public geode::Popup, public TextInputDelegate {
 
 private:
     
@@ -66,6 +66,11 @@ public:
     int currentPage = 1;
 
     bool saved = true;
+
+    // Geode v5 / GD 2.2081: CCEGLView::onGLFWMouseMoveCallBack is now inline and
+    // can no longer be hooked, so hover is driven by polling the mouse position
+    // in this layer's own update loop (Windows only).
+    void update(float dt) override;
 
     void loadPage(int page);
 

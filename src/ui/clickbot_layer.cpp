@@ -1,5 +1,7 @@
 #include "clickbot_layer.hpp"
 
+#include <Geode/utils/async.hpp>
+
 void ClickbotLayer::updateLabels() {
 	auto& g = Global::get();
 
@@ -285,9 +287,9 @@ bool ClickbotLayer::setup() {
 	return true;
 }
 
-ClickSettingsLayer* ClickSettingsLayer::create(std::string button, geode::Popup<>* layer) {
+ClickSettingsLayer* ClickSettingsLayer::create(std::string button, geode::Popup* layer) {
 	ClickSettingsLayer* ret = new ClickSettingsLayer();
-	if (ret->initAnchored(250, 173, button, layer, Utils::getTexture().c_str())) {
+	if (ret->geode::Popup::init(250, 173, Utils::getTexture().c_str()) && ret->setup(button, layer)) {
 		ret->autorelease();
 		return ret;
 	}
@@ -296,7 +298,7 @@ ClickSettingsLayer* ClickSettingsLayer::create(std::string button, geode::Popup<
 	return nullptr;
 }
 
-bool ClickSettingsLayer::setup(std::string button, geode::Popup<>* layer) {
+bool ClickSettingsLayer::setup(std::string button, geode::Popup* layer) {
 	cocos2d::CCPoint offset = (CCDirector::sharedDirector()->getWinSize() - m_mainLayer->getContentSize()) / 2;
     m_mainLayer->setPosition(m_mainLayer->getPosition() - offset);
     m_closeBtn->setPosition(m_closeBtn->getPosition() + offset);
@@ -402,9 +404,10 @@ void ClickSettingsLayer::onSelectFile(CCObject*) {
 	textFilter.files = { "*.mp3", "*.ogg" };
 	fileOptions.filters.push_back(textFilter);
 
-	file::pick(file::PickMode::OpenFile, { Mod::get()->getResourcesDir(), { textFilter } }).listen([this](Result<std::filesystem::path>* res) {
-		if (res->isOk()) {
-			std::filesystem::path path = res->unwrapOrDefault();
+	async::spawn(file::pick(file::PickMode::OpenFile, { Mod::get()->getResourcesDir(), { textFilter } }), [this](Result<std::optional<std::filesystem::path>> res) {
+		std::optional<std::filesystem::path> picked = res.isOk() ? res.unwrap() : std::nullopt;
+		if (picked.has_value()) {
+			std::filesystem::path path = picked.value();
 
 			filenameLabel->setString(path.filename().string().c_str());
 
