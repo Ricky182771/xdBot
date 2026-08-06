@@ -10,6 +10,189 @@ class $modify(SliderTouchLogic) {
     }
 };
 
+namespace {
+
+    // Uppercase is load-bearing, not cosmetic: ffmpeg option *values* are frequently
+    // case-sensitive constants. VAAPI's rate control in particular only accepts
+    // "-rc_mode CQP" — lowercase "cqp" fails with "Undefined constant" and produces no
+    // output file at all. Same for CBR/VBR/QVBR/ICQ and "-profile:v Main/High".
+    const char* const kArgsCharset =
+        " 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_:;.\"\\/[](){}+=<>|!*&'%@,";
+
+    // Shortens `text` with an ellipsis until it fits `maxWidth` at `scale`. CCLabelBMFont
+    // has no built-in truncation and setMaxLabelWidth would rescale the text instead,
+    // which quickly becomes unreadable for a string this long.
+    std::string truncateToWidth(const std::string& text, float scale, float maxWidth) {
+        if (text.empty() || maxWidth <= 0.f) return text;
+
+        CCLabelBMFont* probe = CCLabelBMFont::create(text.c_str(), "chatFont.fnt");
+        if (!probe) return text;
+
+        if (probe->getContentSize().width * scale <= maxWidth) return text;
+
+        std::string shortened = text;
+        while (shortened.size() > 1) {
+            shortened.pop_back();
+            probe->setString((shortened + "...").c_str());
+            if (probe->getContentSize().width * scale <= maxWidth) break;
+        }
+
+        return shortened + "...";
+    }
+
+}
+
+// Compact editor for the native backend's encoder args and filters. These used to be
+// mod.json settings, which meant leaving the render menu to change the codec; they now
+// live next to the rest of the render arguments.
+class NativeArgsLayer : public geode::Popup {
+
+public:
+
+    TextInput* argsInput = nullptr;
+    TextInput* filtersInput = nullptr;
+    RenderSettingsLayer* owner = nullptr;
+
+    STATIC_CREATE(NativeArgsLayer, 340, 190)
+
+    ~NativeArgsLayer() {
+        CC_SAFE_RELEASE(owner);
+    }
+
+    // The owner is retained: it sits underneath this popup and must stay alive for the
+    // refresh callback even if it somehow gets closed first.
+    static NativeArgsLayer* createFor(RenderSettingsLayer* owner) {
+        NativeArgsLayer* ret = create();
+        if (ret) {
+            ret->owner = owner;
+            CC_SAFE_RETAIN(owner);
+        }
+        return ret;
+    }
+
+    void save() {
+        std::string args = argsInput->getString();
+        std::string filters = filtersInput->getString();
+
+        Mod* mod = Mod::get();
+        mod->setSavedValue("render_native_args", args);
+        mod->setSavedValue("render_native_filters", filters);
+
+        if (owner) owner->refreshNativePrefix();
+    }
+
+    void onRestore(CCObject*) {
+        argsInput->setString(Renderer::defaultNativeArgs);
+        filtersInput->setString(Renderer::defaultNativeFilters);
+        save();
+    }
+
+    void onOk(CCObject*) {
+        save();
+        keyBackClicked();
+    }
+
+    bool setup() {
+        setTitle("Native FFmpeg Args");
+
+        Mod* mod = Mod::get();
+        Renderer::ensureNativeArgsMigrated();
+
+        Utils::setBackgroundColor(m_bgSprite);
+
+        CCMenu* menu = CCMenu::create();
+        menu->setPosition(m_mainLayer->getContentSize() / 2);
+        menu->setContentSize({ 0, 0 });
+        m_mainLayer->addChild(menu);
+
+        CCLabelBMFont* lbl = CCLabelBMFont::create(
+            "Prepended to every native render.", "chatFont.fnt");
+        lbl->setPosition({ 0, 58 });
+        lbl->setScale(0.4f);
+        lbl->setOpacity(160);
+        menu->addChild(lbl);
+
+        lbl = CCLabelBMFont::create("Encoder Args:", "bigFont.fnt");
+        lbl->setPosition({ -150, 34 });
+        lbl->setAnchorPoint({ 0, 0.5f });
+        lbl->setScale(0.325f);
+        lbl->setOpacity(200);
+        menu->addChild(lbl);
+
+        argsInput = TextInput::create(300.f, "encoder args", "chatFont.fnt");
+        argsInput->setPosition({ 0, 14 });
+        argsInput->setScale(0.9f);
+        argsInput->setFilter(kArgsCharset);
+        argsInput->setString(mod->getSavedValue<std::string>("render_native_args").c_str());
+        menu->addChild(argsInput);
+
+        lbl = CCLabelBMFont::create("Extra Filters:", "bigFont.fnt");
+        lbl->setPosition({ -150, -12 });
+        lbl->setAnchorPoint({ 0, 0.5f });
+        lbl->setScale(0.325f);
+        lbl->setOpacity(200);
+        menu->addChild(lbl);
+
+        filtersInput = TextInput::create(300.f, "extra filters", "chatFont.fnt");
+        filtersInput->setPosition({ 0, -32 });
+        filtersInput->setScale(0.9f);
+        filtersInput->setFilter(kArgsCharset);
+        filtersInput->setString(mod->getSavedValue<std::string>("render_native_filters").c_str());
+        menu->addChild(filtersInput);
+
+        // Installed only now that both inputs exist: save() reads them both, so wiring the
+        // first one up before the second is constructed leaves a null dereference waiting.
+        argsInput->setCallback([this](const std::string&) { save(); });
+        filtersInput->setCallback([this](const std::string&) { save(); });
+
+        lbl = CCLabelBMFont::create("Clear both for software encoding.", "chatFont.fnt");
+        lbl->setPosition({ 0, -56 });
+        lbl->setScale(0.35f);
+        lbl->setOpacity(130);
+        menu->addChild(lbl);
+
+        ButtonSprite* spr = ButtonSprite::create("Restore");
+        spr->setScale(0.5f);
+        CCMenuItemSpriteExtra* btn = CCMenuItemSpriteExtra::create(
+            spr, this, menu_selector(NativeArgsLayer::onRestore));
+        btn->setPosition({ -60, -78 });
+        menu->addChild(btn);
+
+        spr = ButtonSprite::create("Ok");
+        spr->setScale(0.5f);
+        btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(NativeArgsLayer::onOk));
+        btn->setPosition({ 60, -78 });
+        menu->addChild(btn);
+
+        return true;
+    }
+
+};
+
+void RenderSettingsLayer::onEditNativeArgs(CCObject*) {
+    if (NativeArgsLayer* layer = NativeArgsLayer::createFor(this))
+        layer->show();
+}
+
+void RenderSettingsLayer::refreshNativePrefix() {
+    if (!nativePrefixLabel) return;
+
+    std::string args = Mod::get()->getSavedValue<std::string>("render_native_args");
+    std::string filters = Mod::get()->getSavedValue<std::string>("render_native_filters");
+
+    // The filters are actually merged into the single -vf chain alongside vflip/video
+    // args/fades; "+vf" is shorthand for that, the popup shows the real values.
+    std::string full = args;
+    if (!filters.empty()) {
+        if (!full.empty()) full += "  ";
+        full += "+vf " + filters;
+    }
+
+    if (full.empty()) full = "(software - uses the codec above)";
+
+    nativePrefixLabel->setString(truncateToWidth(full, nativePrefixLabel->getScale(), nativePrefixWidth).c_str());
+}
+
 void RenderSettingsLayer::textChanged(CCTextInputNode* node) {
 
     if (secondsInput->getString() != "" && node == secondsInput) {
@@ -63,6 +246,9 @@ void RenderSettingsLayer::onDefaults(CCObject*) {
             g.mod->setSavedValue("render_fade_out_time", std::to_string(2));
             g.mod->setSavedValue("render_hide_endscreen", false);
             g.mod->setSavedValue("render_hide_levelcomplete", false);
+            g.mod->setSavedValue("render_native_args", std::string(Renderer::defaultNativeArgs));
+            g.mod->setSavedValue("render_native_filters", std::string(Renderer::defaultNativeFilters));
+            g.mod->setSavedValue("render_native_migrated", true);
 
 	        CCArray* children = CCDirector::sharedDirector()->getRunningScene()->getChildren();
             for (CCObject* child : CCArrayExt<CCObject*>(children)) {
@@ -84,7 +270,16 @@ void RenderSettingsLayer::onDefaults(CCObject*) {
 bool RenderSettingsLayer::setup() {
     setTitle("Render Settings");
 
+    // shouldUseAPI() now means "the limited in-process FFmpeg API backend", so it is false
+    // for the native backend — which is what we want: native drives the real ffmpeg CLI and
+    // honours every one of the args/fade/extension/volume settings this block greys out.
     bool usingApi = Renderer::shouldUseAPI();
+
+    bool usingNative = false;
+    #ifdef GEODE_IS_WINDOWS
+    usingNative = Renderer::selectBackend() == VideoBackend::NativeUnix;
+    if (usingNative) Renderer::ensureNativeArgsMigrated();
+    #endif
 
     cocos2d::CCPoint offset = (CCDirector::sharedDirector()->getWinSize() - m_mainLayer->getContentSize()) / 2;
     m_mainLayer->setPosition(m_mainLayer->getPosition() - offset);
@@ -111,7 +306,11 @@ bool RenderSettingsLayer::setup() {
     bg->setOpacity(75);
     bg->setPosition(ccp(-28, 97));
     bg->setAnchorPoint({ 0, 1 });
-    bg->setContentSize({ 392, 55 });
+    // The native backend gets a second line inside this row for the locked prefix. The row
+    // is anchored at its top, so growing it extends downwards into the gap above the Audio
+    // Args row: at 0.355 scale, 76 puts the bottom edge at 97 - 27 = 70, five clear pixels
+    // above that row's top edge at 65.
+    bg->setContentSize({ 392, usingNative ? 76.f : 55.f });
     menu->addChild(bg);
 
     if (usingApi) bg->setOpacity(40);
@@ -138,8 +337,48 @@ bool RenderSettingsLayer::setup() {
     argsInput->setScale(0.75);
     argsInput->setString(mod->getSavedValue<std::string>("render_args").c_str());
     argsInput->setDelegate(this);
-    argsInput->setAllowedChars(" 0123456789abcdefghijklmnopqrstuvwxyz-_:;.\"\\/[](){}+=<>|!*&'%@");
+    argsInput->setAllowedChars(kArgsCharset);
     menu->addChild(argsInput);
+
+    if (usingNative) {
+        // A locked, non-editable echo of what the native backend prepends. Deliberately a
+        // separate node rather than a forced prefix inside argsInput: keeping a protected
+        // region inside a CCTextInputNode means fighting its cursor and selection handling.
+        //
+        // The row spans x -28 .. 111.2 (-28 + 392 * 0.355), so everything here has to stay
+        // inside that. Vertically the row now reaches down to y 70, and this line sits at
+        // 78 with the input's text above it.
+        const float rowRight = -28.f + 392.f * 0.355f;
+        const float lineY = 78.f;
+
+        CCSprite* gear = CCSprite::createWithSpriteFrameName("GJ_optionsBtn_001.png");
+        gear->setScale(0.24f);
+        CCMenuItemSpriteExtra* gearBtn = CCMenuItemSpriteExtra::create(
+            gear, this, menu_selector(RenderSettingsLayer::onEditNativeArgs));
+        // Anchored so the sprite's right edge lands just inside the row.
+        float gearHalfWidth = gearBtn->getContentSize().width * 0.5f;
+        float gearX = rowRight - 3.f - gearHalfWidth;
+        gearBtn->setPosition({ gearX, lineY });
+        menu->addChild(gearBtn);
+
+        CCLabelBMFont* tag = CCLabelBMFont::create("Native:", "goldFont.fnt");
+        tag->setAnchorPoint({ 0, 0.5f });
+        tag->setScale(0.18f);
+        tag->setPosition({ -25, lineY });
+        menu->addChild(tag);
+
+        float textStart = -25.f + tag->getContentSize().width * 0.18f + 4.f;
+        nativePrefixWidth = (gearX - gearHalfWidth - 4.f) - textStart;
+
+        nativePrefixLabel = CCLabelBMFont::create(" ", "chatFont.fnt");
+        nativePrefixLabel->setAnchorPoint({ 0, 0.5f });
+        nativePrefixLabel->setScale(0.26f);
+        nativePrefixLabel->setPosition({ textStart, lineY });
+        nativePrefixLabel->setColor({ 130, 220, 140 });
+        menu->addChild(nativePrefixLabel);
+
+        refreshNativePrefix();
+    }
 
     bg = CCScale9Sprite::create("square02b_001.png", { 0, 0, 80, 80 });
     bg->setScale(0.355f);
@@ -174,7 +413,7 @@ bool RenderSettingsLayer::setup() {
     audioArgsInput->setScale(0.75);
     audioArgsInput->setString(mod->getSavedValue<std::string>("render_audio_args").c_str());
     audioArgsInput->setDelegate(this);
-    audioArgsInput->setAllowedChars(" 0123456789abcdefghijklmnopqrstuvwxyz-_:;.\"\\/[](){}+=<>|!*&'%@");
+    audioArgsInput->setAllowedChars(kArgsCharset);
     menu->addChild(audioArgsInput);
 
     bg = CCScale9Sprite::create("square02b_001.png", { 0, 0, 80, 80 });
@@ -207,7 +446,7 @@ bool RenderSettingsLayer::setup() {
     videoArgsInput->setMaxLabelWidth(165.f);
     videoArgsInput->setScale(0.75);
     videoArgsInput->setString(mod->getSavedValue<std::string>("render_video_args").c_str());
-    videoArgsInput->setAllowedChars(" 0123456789abcdefghijklmnopqrstuvwxyz-_:;.\"\\/[](){}+=<>|!*&'%@");
+    videoArgsInput->setAllowedChars(kArgsCharset);
     videoArgsInput->setDelegate(this);
     menu->addChild(videoArgsInput);
 

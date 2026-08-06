@@ -1,6 +1,7 @@
 #include "../includes.hpp"
 #include "../ui/game_ui.hpp"
 #include "../utils/subprocess.hpp"
+#include "native_ffmpeg.hpp"
 
 #include <Geode/modify/FMODAudioEngine.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -14,6 +15,7 @@
 #include <sstream>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 
 class $modify(CCParticleSystemQuad) {
 
@@ -148,21 +150,166 @@ class $modify(CCScheduler) {
 
 };
 
-bool Renderer::shouldUseAPI() {
-    #ifdef GEODE_IS_WINDOWS
+VideoBackend Renderer::selectBackend() {
+#ifdef GEODE_IS_WINDOWS
+
+    // Running under Wine/Proton with the setting on beats everything else: it is the only
+    // way to reach hardware encoders from a Windows build.
+    if (NativeFFmpeg::isEnabled()) return VideoBackend::NativeUnix;
 
     bool foundApi = Loader::get()->isModLoaded("eclipse.ffmpeg-api");
     std::filesystem::path ffmpegPath = Mod::get()->getSettingValue<std::filesystem::path>("ffmpeg_path");
     bool foundExe = std::filesystem::exists(ffmpegPath) && ffmpegPath.filename().string() == "ffmpeg.exe";
 
-    return !foundExe && foundApi;
+    if (foundExe) return VideoBackend::WindowsExe;
+    if (foundApi) return VideoBackend::FFmpegAPI;
+
+    // Nothing available — Renderer::toggle() reports this to the user before we get to
+    // actually encoding anything.
+    return VideoBackend::WindowsExe;
 
 #else
 
-    return true;
+    return VideoBackend::FFmpegAPI;
 
 #endif
+}
 
+bool Renderer::shouldUseAPI() {
+    return Renderer::selectBackend() == VideoBackend::FFmpegAPI;
+}
+
+bool Renderer::hasVideoCodecArg(const std::string& args) {
+    // Substring matching is not enough: "-c:v" would miss "-vcodec" entirely, and the
+    // resulting duplicate codec silently loses to whichever ffmpeg parses last.
+    std::istringstream stream(args);
+    std::string token;
+
+    while (stream >> token) {
+        if (token == "-c:v" || token == "-codec:v" || token == "-vcodec") return true;
+    }
+
+    return false;
+}
+
+bool Renderer::hasHardwareUpload(const std::string& filters) {
+    // The question is not "does the chain mention hwupload" but "do the frames leave the
+    // chain on the GPU". A chain can go up and back down again
+    // (format=nv12,hwupload,scale_vaapi=...,hwdownload,format=nv12 ends in software
+    // frames and does still want an output pixel format), so only the *last* hardware
+    // transfer decides.
+    bool onGpu = false;
+
+    std::stringstream stream(filters);
+    std::string filter;
+
+    // Filter options are separated by ':', so a plain split on ',' correctly walks a
+    // linear chain. Labelled filtergraphs are not something this renderer builds.
+    while (std::getline(stream, filter, ',')) {
+        size_t start = filter.find_first_not_of(" \t");
+        if (start == std::string::npos) continue;
+        size_t end = filter.find_last_not_of(" \t");
+        filter = filter.substr(start, end - start + 1);
+
+        std::string name = filter.substr(0, filter.find('='));
+
+        if (name == "hwdownload") onGpu = false;
+        else if (name == "hwupload" || name == "hwupload_cuda") onGpu = true;
+        // hwmap goes either way; mode=read (and read+write) maps the frames back for CPU
+        // access, anything else maps up to the device.
+        else if (name == "hwmap") onGpu = filter.find("mode=read") == std::string::npos;
+    }
+
+    return onGpu;
+}
+
+std::string Renderer::stripPixelFormatArg(const std::string& args) {
+    // Removing the option is not the same as declining to add the default: xdBot seeds
+    // render_args to "-pix_fmt yuv420p" for every user on first launch, so the value is
+    // essentially always present and has to be taken back out for a hardware chain.
+    // The matched tokens are spliced out of the original string rather than the string
+    // being rebuilt from its tokens: rebuilding would re-join everything with a single
+    // space and silently rewrite arguments this function is not supposed to touch
+    // (-metadata title="my  render" would come back out with one space).
+    constexpr const char* whitespace = " \t\r\n\f\v";
+
+    std::string result = args;
+    size_t pos = 0;
+
+    while (true) {
+        size_t start = result.find_first_not_of(whitespace, pos);
+        if (start == std::string::npos) break;
+
+        size_t end = result.find_first_of(whitespace, start);
+        std::string token = result.substr(start, end == std::string::npos ? std::string::npos : end - start);
+
+        if (token != "-pix_fmt" && token != "-pixel_format") {
+            if (end == std::string::npos) break;
+            pos = end;
+            continue;
+        }
+
+        // The option's value, if it has one — a trailing "-pix_fmt" with nothing after it
+        // is dropped on its own.
+        size_t cutEnd = end;
+        if (cutEnd != std::string::npos) {
+            size_t valueStart = result.find_first_not_of(whitespace, cutEnd);
+            cutEnd = (valueStart == std::string::npos)
+                ? std::string::npos
+                : result.find_first_of(whitespace, valueStart);
+        }
+
+        size_t eraseFrom = start;
+        size_t eraseTo = result.size();
+
+        if (cutEnd != std::string::npos) {
+            // Swallow the separator up to the next argument, so the ones that stay keep
+            // exactly the spacing they had.
+            size_t next = result.find_first_not_of(whitespace, cutEnd);
+            if (next != std::string::npos) eraseTo = next;
+        }
+
+        // Nothing follows, so the separator to swallow is the one in front instead.
+        if (eraseTo >= result.size() && eraseFrom > 0) {
+            size_t prevEnd = result.find_last_not_of(whitespace, eraseFrom - 1);
+            eraseFrom = (prevEnd == std::string::npos) ? 0 : prevEnd + 1;
+        }
+
+        result.erase(eraseFrom, eraseTo - eraseFrom);
+        pos = eraseFrom;
+    }
+
+    return result;
+}
+
+void Renderer::ensureNativeArgsMigrated() {
+#ifdef GEODE_IS_WINDOWS
+
+    Mod* mod = Mod::get();
+    if (!mod || mod->getSavedValue<bool>("render_native_migrated")) return;
+
+    // These used to be mod.json settings. They now live with the rest of the render
+    // options, but a user who customised them must not silently lose that: read whatever
+    // Geode persisted for the old settings before falling back to the defaults.
+    auto legacyValue = [mod](const char* key, const char* fallback) -> std::string {
+        // Still registered (older mod.json)? Then that is authoritative.
+        std::string current = mod->getSettingValue<std::string>(key);
+        if (!current.empty()) return current;
+
+        const matjson::Value& data = mod->getSavedSettingsData();
+        if (data.contains(key)) {
+            std::string saved = data[key].asString().unwrapOr(std::string());
+            if (!saved.empty()) return saved;
+        }
+
+        return fallback;
+    };
+
+    mod->setSavedValue("render_native_args", legacyValue("native_ffmpeg_args", Renderer::defaultNativeArgs));
+    mod->setSavedValue("render_native_filters", legacyValue("native_ffmpeg_filters", Renderer::defaultNativeFilters));
+    mod->setSavedValue("render_native_migrated", true);
+
+#endif
 }
 
 bool Renderer::toggle() {
@@ -176,18 +323,28 @@ bool Renderer::toggle() {
     std::filesystem::path ffmpegPath = Mod::get()->getSettingValue<std::filesystem::path>("ffmpeg_path");
     bool foundExe = std::filesystem::exists(ffmpegPath) && ffmpegPath.filename().string() == "ffmpeg.exe";
 
-    g.renderer.usingApi = Renderer::shouldUseAPI();
+    g.renderer.backend = Renderer::selectBackend();
 
     if (g.renderer.recording || g.renderer.recordingAudio) {
         g.renderer.recordingAudio ? g.renderer.stopAudio() : g.renderer.stop(Global::getCurrentFrame());
     }
     else {
-        
+
 #ifdef GEODE_IS_WINDOWS
-        if (!foundExe && !foundApi) {
+        bool foundNative = g.renderer.backend == VideoBackend::NativeUnix;
+
+        if (!foundExe && !foundApi && !foundNative) {
+            std::string message = "<cl>FFmpeg</c> not found, set the path to the .exe in mod settings or install FFmpeg API.";
+
+            // Under Wine/Proton there is a third option, so do not tell the user they are stuck.
+            if (NativeFFmpeg::isUnderWine())
+                message += "\nYou're on <cy>Wine/Proton</c>: enable <cl>Use Native FFmpeg</c> in mod settings to use your system's ffmpeg instead.";
+
+            message += "\nOpen download link?";
+
             geode::createQuickPopup(
                 "Error",
-                "<cl>FFmpeg</c> not found, set the path to the .exe in mod settings or install FFmpeg API.\nOpen download link?",
+                message.c_str(),
                 "Cancel", "Yes",
                 [](auto, bool btn2) {
                     if (btn2) {
@@ -257,7 +414,15 @@ void Renderer::start() {
     auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
     
     std::string filename = fmt::format("render_{}_{}{}", std::string_view(pl->m_level->m_levelName), std::to_string(timestamp), extension);
-    std::string path = (Mod::get()->getSettingValue<std::filesystem::path>("render_folder") / filename).string();
+
+    // `filename` is UTF-8 (it embeds the level name straight out of GD), but constructing
+    // a path from a narrow string decodes it as the ANSI codepage. Build the real path
+    // once, from the widened name, and keep it: `path` below is the lossy narrow form the
+    // existing backends have always used, and round-tripping back through it would turn
+    // any non-ASCII level name into U+FFFD.
+    std::filesystem::path pathReal =
+        Mod::get()->getSettingValue<std::filesystem::path>("render_folder") / std::filesystem::path(Utils::widen(filename));
+    std::string path = pathReal.string();
 
     width = std::stoi(mod->getSavedValue<std::string>("render_width2"));
     height = std::stoi(mod->getSavedValue<std::string>("render_height"));
@@ -276,6 +441,7 @@ void Renderer::start() {
     dontRender = true;
     recording = true;
     frameHasData = false;
+    encoderFailed = false;
     levelFinished = false;
     startedAudio = false;
     timeAfter = 0.f;
@@ -321,11 +487,30 @@ void Renderer::start() {
         )->show();
     }
 
-    std::thread([&, path, songFile, songOffset, fadeIn, fadeOut, extension, bitrateApi, settings]() {
+    std::thread([&, path, pathReal, songFile, songOffset, fadeIn, fadeOut, extension, bitrateApi, settings]() {
+        bool nativeBackend = false;
+        std::string nativeArgs;
+        std::string nativeFilters;
+
+        #ifdef GEODE_IS_WINDOWS
+        nativeBackend = backend == VideoBackend::NativeUnix;
+        if (nativeBackend) {
+            Renderer::ensureNativeArgsMigrated();
+            nativeArgs = Mod::get()->getSavedValue<std::string>("render_native_args");
+            nativeFilters = Mod::get()->getSavedValue<std::string>("render_native_filters");
+        }
+        #endif
+
         if (!codec.empty()) codec = "-c:v " + codec + " ";
         if (!bitrate.empty()) bitrate = "-b:v " + bitrate + " ";
-        if (extraArgs.empty()) extraArgs = "-pix_fmt yuv420p";
         if (videoArgs.empty()) videoArgs = "colorspace=all=bt709:iall=bt470bg:fast=1";
+
+        // native args normally carry their own video codec (h264_vaapi, ...); emitting the
+        // render-settings codec as well would put two of them on the command line and
+        // ffmpeg would silently keep the last, undoing the user's choice. Extra Args counts
+        // too: before these settings had their own popup it was the obvious place to put
+        // "-c:v h264_vaapi", so plenty of working configs have it there.
+        std::string nativeCodec = Renderer::hasVideoCodecArg(nativeArgs + " " + extraArgs) ? "" : codec;
 
         float fadeInTime = geode::utils::numFromString<float>(Mod::get()->getSavedValue<std::string>("render_fade_in_time")).unwrapOr(0.f);
         bool fadeInVideo = Mod::get()->getSavedValue<bool>("render_fade_in") && fadeInTime != 0.f;
@@ -336,12 +521,85 @@ void Renderer::start() {
         std::string command;
         #ifdef GEODE_IS_WINDOWS
         subprocess::Popen process;
+        NativeFFmpeg::VideoPipe pipe;
+        bool pipeBroke = false;
         #endif
+
+        // The lossless path, straight from render_folder / filename — never reconstructed
+        // from the narrow `path`, whose encoding the existing backends round-trip through
+        // the ANSI codepage. Every native-backend filesystem/ffmpeg operation uses this.
+        // Declared unconditionally so the capture is always used; only native reads it.
+        [[maybe_unused]] const std::filesystem::path& videoPathW = pathReal;
+
+        // Every give-up path in this thread MUST go through here. captureFrame() spins on
+        // the main thread until either frameHasData clears or encoderFailed is set, and the
+        // encoder thread is the only thing that can do either — so a bail-out that forgets
+        // the flag (especially one that happens before the consume loop below is even
+        // reached) freezes the game solid, with no way to show a popup and no way out but
+        // killing the process. Routing every exit through one helper means it cannot be
+        // forgotten the next time a failure path is added.
+        auto abortRender = [&] {
+            encoderFailed = true;
+            audioMode = AudioMode::Off;
+            stop();
+        };
 
         if (fadeInVideo)
             fadeArgs = fmt::format(",fade=t=in:st=0:d={}", fadeInTime);
 
-        if (usingApi) {
+        // An output pixel format cannot be applied to frames that leave the filter chain on
+        // the GPU. It is not enough to decline to add the default: xdBot seeds render_args
+        // to "-pix_fmt yuv420p" on first launch (and Restore Defaults writes it back), so
+        // the user's own value is essentially always there and has to be taken out.
+        //
+        // For a software chain it must stay: without it libavfilter negotiates yuv444p out
+        // of the colorspace filter and x264 writes High 4:4:4 Predictive, which most
+        // players and NLEs cannot open.
+        std::string effectiveChain = videoArgs + "," + nativeFilters;
+
+        if (nativeBackend && Renderer::hasHardwareUpload(effectiveChain))
+            extraArgs = Renderer::stripPixelFormatArg(extraArgs);
+        else if (extraArgs.empty())
+            extraArgs = "-pix_fmt yuv420p";
+
+        #ifdef GEODE_IS_WINDOWS
+        if (nativeBackend) {
+            // These fragments — and only these — are interpolated into /bin/sh unquoted,
+            // because word splitting is how a multi-token argument string reaches ffmpeg at
+            // all. That makes an unbalanced quote a shell syntax error, which would
+            // otherwise kill the render with nothing to show for it.
+            //
+            // Video Args and Native FFmpeg Filters are deliberately NOT checked: they only
+            // ever reach the script through NativeFFmpeg::shQuote (as part of the -vf
+            // chain), where a lone ' becomes '\'' and is inert to the shell. Checking them
+            // would reject filters like drawtext=text=don't that ffmpeg accepts happily —
+            // and that the ffmpeg.exe backend renders without complaint.
+            const std::vector<std::pair<std::string, std::string>> fragments = {
+                { "Extra Args", extraArgs },
+                { "Audio Args", extraAudioArgs },
+                { "Native FFmpeg Args", nativeArgs }
+            };
+
+            for (const auto& fragment : fragments) {
+                if (NativeFFmpeg::hasBalancedQuotes(fragment.second)) continue;
+
+                log::error("Unbalanced quote in {}: {}", fragment.first, fragment.second);
+
+                std::string message = fmt::format(
+                    "<cy>{}</c> has an unbalanced quote, which the native FFmpeg backend cannot run.\nFix it in the render settings and try again.",
+                    fragment.first
+                );
+
+                Loader::get()->queueInMainThread([message] {
+                    FLAlertLayer::create("Error", message.c_str(), "Ok")->show();
+                });
+
+                return abortRender();
+            }
+        }
+        #endif
+
+        if (backend == VideoBackend::FFmpegAPI) {
             auto res = ffmpeg.init(settings);
             if (res.isErr()) {
                 Loader::get()->queueInMainThread([] {
@@ -349,29 +607,66 @@ void Renderer::start() {
                     FLAlertLayer::create("Error", "FFmpeg API failed to initialize: ", "Ok")->show();
                 });
 
-                audioMode = AudioMode::Off;
-                return stop();
+                return abortRender();
             }
-            
+
         } else {
             #ifdef GEODE_IS_WINDOWS
-            command = fmt::format(
-                "\"{}\" -y -f rawvideo -pix_fmt rgb24 -s {}x{} -r {} -i - {}{}{} -vf \"vflip,{}{}\" -an \"{}\" ",
-                ffmpegPath,
-                std::to_string(width),
-                std::to_string(height),
-                std::to_string(fps),
-                codec,
-                bitrate,
-                extraArgs,
-                videoArgs,
-                fadeArgs,
-                path
-            );
+            if (nativeBackend) {
+                auto outUnix = NativeFFmpeg::toUnixPath(videoPathW);
+                if (!outUnix) {
+                    Loader::get()->queueInMainThread([] {
+                        FLAlertLayer::create("Error", "Could not translate the render path for native FFmpeg.", "Ok")->show();
+                    });
 
-            log::info("Executing: {}", command);
+                    return abortRender();
+                }
 
-            process = subprocess::Popen(command);
+                // Build the chain as pieces and join them: a stray or doubled comma makes
+                // ffmpeg bail out, and a second -vf would silently override the first.
+                std::string filters = NativeFFmpeg::joinFilters({ "vflip", videoArgs, fadeArgs, nativeFilters });
+
+                std::string beforeInput = fmt::format(
+                    "-y -hide_banner -f rawvideo -pix_fmt rgb24 -s {}x{} -r {}",
+                    width, height, fps
+                );
+
+                std::string afterInput = NativeFFmpeg::joinArgs({
+                    nativeCodec,
+                    nativeArgs,
+                    bitrate,
+                    extraArgs,
+                    "-vf", NativeFFmpeg::shQuote(filters),
+                    "-an", NativeFFmpeg::shQuote(*outUnix)
+                });
+
+                if (!pipe.start(beforeInput, afterInput)) {
+                    Loader::get()->queueInMainThread([] {
+                        FLAlertLayer::create("Error", "Native <cl>FFmpeg</c> failed to start. Check the mod's log for details.", "Ok")->show();
+                    });
+
+                    return abortRender();
+                }
+            }
+            else {
+                command = fmt::format(
+                    "\"{}\" -y -f rawvideo -pix_fmt rgb24 -s {}x{} -r {} -i - {}{}{} -vf \"vflip,{}{}\" -an \"{}\" ",
+                    ffmpegPath,
+                    std::to_string(width),
+                    std::to_string(height),
+                    std::to_string(fps),
+                    codec,
+                    bitrate,
+                    extraArgs,
+                    videoArgs,
+                    fadeArgs,
+                    path
+                );
+
+                log::info("Executing: {}", command);
+
+                process = subprocess::Popen(command);
+            }
             #endif
         }
 
@@ -381,19 +676,35 @@ void Renderer::start() {
                 const std::vector<uint8_t> frame = currentFrame;
                 frameHasData = false;
                 lock.unlock();
-                if (usingApi) {
+                if (backend == VideoBackend::FFmpegAPI) {
                     auto res = ffmpeg.writeFrame(frame);
                     if (res.isErr()) {
                         Loader::get()->queueInMainThread([] {
                             FLAlertLayer::create("Error", "FFmpeg API failed: ", "Ok")->show();
                         });
 
-                        audioMode = AudioMode::Off;
-                        stop();
+                        // Releases captureFrame before stop(), so the main thread can never
+                        // be left spinning on a frame nobody is going to consume.
+                        abortRender();
                         break;
                     }
                 }
                 #ifdef GEODE_IS_WINDOWS
+                else if (nativeBackend) {
+                    if (!pipe.writeFrame(frame)) {
+                        Loader::get()->queueInMainThread([] {
+                            FLAlertLayer::create(
+                                "Error",
+                                "Native <cl>FFmpeg</c> stopped accepting frames — it may have crashed, stalled or run out of disk space.\nCheck the mod's log for details.",
+                                "Ok"
+                            )->show();
+                        });
+
+                        pipeBroke = true;
+                        abortRender();
+                        break;
+                    }
+                }
                 else
                     process.m_stdin.write(frame.data(), frame.size());
                 #endif
@@ -401,12 +712,69 @@ void Renderer::start() {
             else lock.unlock();
         }
 
-        if (usingApi) {
+        #ifdef GEODE_IS_WINDOWS
+        // ffmpeg can legitimately take a long time to drain; keep the user informed rather
+        // than leaving the game apparently frozen on "Saving Render...".
+        auto nativeProgress = [](int elapsed) {
+            if (elapsed % 15 == 0) log::info("Native FFmpeg still working ({}s elapsed)", elapsed);
+            if (elapsed % 60 != 0) return;
+            Loader::get()->queueInMainThread([elapsed] {
+                Notification::create(
+                    fmt::format("Still encoding... ({}s)", elapsed),
+                    NotificationIcon::Loading,
+                    NOTIFICATION_LONG_TIME
+                )->show();
+            });
+        };
+
+        // A timeout is not a failure — ffmpeg keeps running and keeps writing. Say so
+        // instead of claiming an error, and skip every rename/delete that would fight it.
+        auto reportStillRunning = [](const char* what) {
+            std::string message = fmt::format(
+                "Native <cl>FFmpeg</c> is taking unusually long ({}) and is <cy>still running</c> in the background.\n"
+                "Leave the game open; the finished file should appear in your renders folder shortly.",
+                what
+            );
+            Loader::get()->queueInMainThread([message] {
+                FLAlertLayer::create("Render", message.c_str(), "Ok")->show();
+            });
+        };
+        #endif
+
+        if (backend == VideoBackend::FFmpegAPI) {
             ffmpeg.stop();
         }
         else {
             #ifdef GEODE_IS_WINDOWS
-            if (process.close()) {
+            if (nativeBackend) {
+                // A broken pipe means ffmpeg is already gone or wedged; don't sit around
+                // for ten minutes waiting on a corpse.
+                int code = pipe.finish(pipeBroke ? 30000 : 600000, nativeProgress);
+
+                if (NativeFFmpeg::isStillRunning(code)) {
+                    // Only reassuring when nothing has gone wrong yet. After a broken pipe
+                    // the user has already been told the encoder stopped taking frames, and
+                    // telling them the render is fine and on its way would flatly contradict
+                    // that — the timeout here is a wedged ffmpeg, not a slow one.
+                    if (!pipeBroke) {
+                        reportStillRunning("encoding the video");
+                        return;
+                    }
+                    log::warn("Native FFmpeg did not exit after the pipe broke; leaving the output alone.");
+                    return;
+                }
+
+                // A broken pipe was already reported above; don't stack a second popup.
+                if (code != 0 || pipeBroke) {
+                    if (!pipeBroke) {
+                        Loader::get()->queueInMainThread([] {
+                            FLAlertLayer::create("Error", "There was an error saving the render. Wrong render Args.", "Ok")->show();
+                        });
+                    }
+                    return;
+                }
+            }
+            else if (process.close()) {
                 Loader::get()->queueInMainThread([] {
                     FLAlertLayer::create("Error", "There was an error saving the render. Wrong render Args.", "Ok")->show();
                 });
@@ -443,7 +811,15 @@ void Renderer::start() {
         std::filesystem::path tempPath = std::filesystem::path(path).parent_path() / ("temp_" + std::filesystem::path(path).filename().string());
         std::filesystem::path tempPathAudio = (Mod::get()->getSaveDir() / "temp_audio_file.wav");
 
-        if (usingApi) {
+        #ifdef GEODE_IS_WINDOWS
+        // Native ffmpeg is handed the UTF-8 form of the path, so the temp file the rename
+        // at the bottom of this function looks for must be derived from the same wide path
+        // rather than from the ACP-decoded one.
+        if (nativeBackend)
+            tempPath = videoPathW.parent_path() / (std::wstring(L"temp_") + videoPathW.filename().wstring());
+        #endif
+
+        if (backend == VideoBackend::FFmpegAPI) {
             std::string file = audioMode == AudioMode::Song ? songFile : "fmodoutput.wav";
             auto res = ffmpeg::events::AudioMixer::mixVideoAudio(path, file, tempPath);
             log::debug("XD");
@@ -462,29 +838,117 @@ void Renderer::start() {
             float fadeOutStart = totalTime - fadeOutTime;
 
             if (fadeOutVideo) {
-                command = fmt::format("\"{}\" -i \"{}\" -vf \"fade=t=out:st={}:d={}\" {}{}-c:a copy \"{}\"", ffmpegPath, path, fadeOutStart, std::to_string(fadeOutTime), codec, bitrate, path + "_temp" + extension);
+                std::string fadedPath = path + "_temp" + extension;
+                // Same concatenation as above, but built off the lossless path.
+                std::filesystem::path fadedPathW = videoPathW.wstring() + L"_temp" + Utils::widen(extension);
+                bool fadeFailed = true;
+                bool fadeStillRunning = false;
 
-                log::info("Executing (Fade Out): {}", command);
-                process = subprocess::Popen(command);
-                if (!process.close()) {
+                if (nativeBackend) {
+                    auto inUnix = NativeFFmpeg::toUnixPath(videoPathW);
+                    auto outUnix = NativeFFmpeg::toUnixPath(fadedPathW);
+
+                    if (!inUnix || !outUnix)
+                        log::warn("Failed to translate the fade out paths for native FFmpeg.");
+                    else {
+                        // The fade filter is software, so the hardware upload has to be
+                        // re-appended after it, exactly like in the main encode.
+                        std::string filters = NativeFFmpeg::joinFilters({
+                            fmt::format("fade=t=out:st={}:d={}", fadeOutStart, fadeOutTime),
+                            nativeFilters
+                        });
+
+                        std::string args = NativeFFmpeg::joinArgs({
+                            "-y", "-hide_banner",
+                            "-i", NativeFFmpeg::shQuote(*inUnix),
+                            "-vf", NativeFFmpeg::shQuote(filters),
+                            nativeCodec,
+                            nativeArgs,
+                            bitrate,
+                            "-c:a copy",
+                            NativeFFmpeg::shQuote(*outUnix)
+                        });
+
+                        // A full re-encode of the whole render, so give it a long leash.
+                        int code = NativeFFmpeg::runBlocking(args, 1800000, nativeProgress);
+                        fadeStillRunning = NativeFFmpeg::isStillRunning(code);
+                        fadeFailed = code != 0;
+                    }
+                }
+                else {
+                    command = fmt::format("\"{}\" -i \"{}\" -vf \"fade=t=out:st={}:d={}\" {}{}-c:a copy \"{}\"", ffmpegPath, path, fadeOutStart, std::to_string(fadeOutTime), codec, bitrate, fadedPath);
+
+                    log::info("Executing (Fade Out): {}", command);
+                    process = subprocess::Popen(command);
+                    fadeFailed = process.close();
+                }
+
+                // Bail out entirely rather than racing a still-running ffmpeg for the file.
+                if (fadeStillRunning) {
+                    reportStillRunning("applying the fade out");
+                    return;
+                }
+
+                if (!fadeFailed) {
                     std::error_code ec;
-                    std::filesystem::remove(path, ec);
+                    std::filesystem::remove(nativeBackend ? videoPathW : std::filesystem::path(path), ec);
                     if (ec) log::warn("Failed to remove old render file.");
                     else {
                         ec.clear();
-                        std::filesystem::rename(path + "_temp" + extension, path, ec);
+                        std::filesystem::rename(
+                            nativeBackend ? fadedPathW : std::filesystem::path(fadedPath),
+                            nativeBackend ? videoPathW : std::filesystem::path(path),
+                            ec
+                        );
                         if (ec) log::warn("Failed to rename temp render file.");
                     }
                 } else log::debug("Fade Out Error xD");
             }
 
             if (audioMode == AudioMode::Record) {
-                command = fmt::format("\"{}\" -i \"fmodoutput.wav\" -acodec pcm_s16le -ar 44100 -ac 2 \"{}\"",
-                    ffmpegPath, tempPathAudio
-                );
+                bool wavFailed = true;
+                bool wavStillRunning = false;
 
-                process = subprocess::Popen(command);  // Fix ffmpeg not reading it
-                if (process.close()) {
+                if (nativeBackend) {
+                    // "fmodoutput.wav" is relative to the game's cwd, which the native
+                    // ffmpeg does not share — resolve it before translating.
+                    std::error_code ec;
+                    std::filesystem::path fmodPath = std::filesystem::absolute("fmodoutput.wav", ec);
+                    if (ec) fmodPath = "fmodoutput.wav";
+
+                    auto inUnix = NativeFFmpeg::toUnixPath(fmodPath);
+                    auto outUnix = NativeFFmpeg::toUnixPath(tempPathAudio);
+
+                    if (!inUnix || !outUnix)
+                        log::warn("Failed to translate the recorded audio paths for native FFmpeg.");
+                    else {
+                        std::string args = NativeFFmpeg::joinArgs({
+                            "-y", "-hide_banner",
+                            "-i", NativeFFmpeg::shQuote(*inUnix),
+                            "-acodec pcm_s16le -ar 44100 -ac 2",
+                            NativeFFmpeg::shQuote(*outUnix)
+                        });
+
+                        int code = NativeFFmpeg::runBlocking(args, 600000, nativeProgress);
+                        wavStillRunning = NativeFFmpeg::isStillRunning(code);
+                        wavFailed = code != 0;
+                    }
+                }
+                else {
+                    command = fmt::format("\"{}\" -i \"fmodoutput.wav\" -acodec pcm_s16le -ar 44100 -ac 2 \"{}\"",
+                        ffmpegPath, tempPathAudio
+                    );
+
+                    process = subprocess::Popen(command);  // Fix ffmpeg not reading it
+                    wavFailed = process.close();
+                }
+
+                if (wavStillRunning) {
+                    reportStillRunning("converting the recorded audio");
+                    return;
+                }
+
+                if (wavFailed) {
                     Loader::get()->queueInMainThread([] {
                         FLAlertLayer::create("Error", "There was an error adding the song. ID: 140", "Ok")->show();
                     });
@@ -513,24 +977,70 @@ void Renderer::start() {
 
                 std::string volume = audioMode == AudioMode::Song ? fmt::format(",volume={:.2f}", musicVolume) : "";
 
-                command = fmt::format(
-                    "\"{}\" -y -ss {} -i \"{}\" -i \"{}\" -t {} -c:v copy {} -filter:a \"[1:a]adelay=0|0{}{}{}\" \"{}\"",
-                    ffmpegPath,
-                    offset,
-                    file,
-                    path,
-                    totalTime,
-                    extraAudioArgs,
-                    fadeInString,
-                    fadeOutString,
-                    volume,
-                    tempPath
-                );
+                bool audioFailed = true;
+                bool audioStillRunning = false;
 
-                log::info("Executing (Audio): {}", command);
+                if (nativeBackend) {
+                    // tempPathAudio is already a real path object; songFile is a narrow
+                    // string and needs the same UTF-8 treatment as the render path.
+                    auto audioUnix = audioMode == AudioMode::Song
+                        ? NativeFFmpeg::toUnixPath(std::filesystem::path(Utils::widen(songFile)))
+                        : NativeFFmpeg::toUnixPath(tempPathAudio);
+                    auto videoUnix = NativeFFmpeg::toUnixPath(videoPathW);
+                    auto outUnix = NativeFFmpeg::toUnixPath(tempPath);
 
-                auto process = subprocess::Popen(command);
-                if (process.close()) {
+                    if (!audioUnix || !videoUnix || !outUnix)
+                        log::warn("Failed to translate the audio mux paths for native FFmpeg.");
+                    else {
+                        // The video is stream-copied here, so no encoder options are needed.
+                        std::string audioFilter = fmt::format("[1:a]adelay=0|0{}{}{}", fadeInString, fadeOutString, volume);
+
+                        std::string args = NativeFFmpeg::joinArgs({
+                            "-y", "-hide_banner",
+                            "-ss", fmt::format("{}", offset),
+                            "-i", NativeFFmpeg::shQuote(*audioUnix),
+                            "-i", NativeFFmpeg::shQuote(*videoUnix),
+                            "-t", fmt::format("{}", totalTime),
+                            "-c:v copy",
+                            extraAudioArgs,
+                            "-filter:a", NativeFFmpeg::shQuote(audioFilter),
+                            NativeFFmpeg::shQuote(*outUnix)
+                        });
+
+                        int code = NativeFFmpeg::runBlocking(args, 900000, nativeProgress);
+                        audioStillRunning = NativeFFmpeg::isStillRunning(code);
+                        audioFailed = code != 0;
+                    }
+                }
+                else {
+                    command = fmt::format(
+                        "\"{}\" -y -ss {} -i \"{}\" -i \"{}\" -t {} -c:v copy {} -filter:a \"[1:a]adelay=0|0{}{}{}\" \"{}\"",
+                        ffmpegPath,
+                        offset,
+                        file,
+                        path,
+                        totalTime,
+                        extraAudioArgs,
+                        fadeInString,
+                        fadeOutString,
+                        volume,
+                        tempPath
+                    );
+
+                    log::info("Executing (Audio): {}", command);
+
+                    auto process = subprocess::Popen(command);
+                    audioFailed = process.close();
+                }
+
+                // Returning here without the rename below would leave an orphan temp file
+                // next to a stale original, so make sure the user knows it is still coming.
+                if (audioStillRunning) {
+                    reportStillRunning("adding the audio");
+                    return;
+                }
+
+                if (audioFailed) {
                     Loader::get()->queueInMainThread([] {
                         FLAlertLayer::create("Error", "There was an error adding the song. Wrong Audio Args.", "Ok")->show();
                     });
@@ -542,11 +1052,16 @@ void Renderer::start() {
         }
 
         std::error_code ec;
-        std::filesystem::remove(Utils::widen(path), ec);
+        // pathReal, never Utils::widen(path): `path` is the ACP-encoded narrow form of this
+        // very path, and widen() decodes with CP_UTF8, so round-tripping a non-ASCII level
+        // name through it yields U+FFFD. The rename would then fail and leave the finished
+        // file sitting there as temp_render_<name>_....mp4 while the user is told the render
+        // was saved.
+        std::filesystem::remove(pathReal, ec);
         if (ec) log::warn("Failed to remove old render file.");
         else {
             ec.clear();
-            std::filesystem::rename(tempPath, Utils::widen(path), ec);
+            std::filesystem::rename(tempPath, pathReal, ec);
             if (ec) log::warn("Failed to rename temp render file.");
         }
 
@@ -572,7 +1087,8 @@ void Renderer::stop(int frame) {
     recording = false;
     timeAfter = 0.f;
 
-    if (usingApi) audioMode = AudioMode::Off;
+    // The in-process API backend cannot mux audio the way the ffmpeg CLI backends can.
+    if (backend == VideoBackend::FFmpegAPI) audioMode = AudioMode::Off;
 
     if (PlayLayer* pl = PlayLayer::get()) {
 
@@ -622,7 +1138,9 @@ void Renderer::changeRes(bool og) {
 }
 
 void MyRenderTexture::begin() {
-    if (Global::get().renderer.usingApi) {
+    // NOTE: this picks the *GL capture path*, not the encoder. Only the ffmpeg.exe
+    // backend wants the EXT framebuffer functions.
+    if (Global::get().renderer.usesCoreGL()) {
         glGetIntegerv(GL_FRAMEBUFFER_BINDING, &old_fbo);
 
         texture = new CCTexture2D();
@@ -680,7 +1198,8 @@ void MyRenderTexture::capture(std::mutex& lock, std::vector<uint8_t>& data, vola
     CCDirector* director = CCDirector::sharedDirector();
     PlayLayer* pl = PlayLayer::get();
 
-    if (Global::get().renderer.usingApi) {
+    // Same as in begin(): GL capture path, not the encoder choice.
+    if (Global::get().renderer.usesCoreGL()) {
         glViewport(0, 0, width, height);
         glGetIntegerv(GL_FRAMEBUFFER_BINDING, &old_fbo);
         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
@@ -718,7 +1237,18 @@ void MyRenderTexture::capture(std::mutex& lock, std::vector<uint8_t>& data, vola
 }
 
 void Renderer::captureFrame() {
-    while (frameHasData) {}
+    // Runs on the main thread. Nothing but the encoder thread clears frameHasData, so a
+    // dead encoder (stalled ffmpeg, full disk) would hang the game here with no way out
+    // but killing the process.
+    //
+    // The yield matters: the native backend's very first frame waits a second or two while
+    // ffmpeg binds its listening socket, and a bare spin turns that into a fully busy core
+    // fighting the encoder thread for the CPU it is waiting on. Yielding only gives up the
+    // rest of the current time slice when another thread is actually runnable, so the
+    // normal case (the encoder has already consumed the frame) is unaffected.
+    while (frameHasData && !encoderFailed) std::this_thread::yield();
+    if (encoderFailed) return;
+
     renderer.capture(lock, currentFrame, frameHasData);
 }
 int wa = 0;

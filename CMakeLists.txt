@@ -14,6 +14,7 @@ add_library(${PROJECT_NAME} SHARED
     src/utils/utils.cpp
     src/gdr/gdr.cpp
     src/renderer/renderer.cpp
+    src/renderer/native_ffmpeg.cpp
 
     src/hacks/other.cpp
     src/hacks/tps_bypass.cpp

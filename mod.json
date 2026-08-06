@@ -113,6 +113,20 @@
 			"default": "",
 			"platforms": ["win"]
 		},
+		"native_ffmpeg": {
+			"name": "Use Native FFmpeg (Wine/Proton)",
+			"description": "Renders through your system's <cl>native Linux FFmpeg</c> instead of a Windows one. Only takes effect when GD is running under <cy>Wine/Proton</c> on Linux; it is ignored on real Windows. This is what makes <cg>GPU-accelerated encoding</c> (VAAPI/NVENC/QSV) possible, since a Windows FFmpeg build inside Proton can only encode in software.",
+			"type": "bool",
+			"default": true,
+			"platforms": ["win"]
+		},
+		"native_ffmpeg_path": {
+			"name": "Native FFmpeg Path",
+			"description": "The native FFmpeg binary to use when the host one at <cl>/run/host/usr/bin/ffmpeg</c> (Steam's container runtime) is not present. Leave as <cl>ffmpeg</c> to just use whatever is in your PATH.\nThe encoder arguments and filters are edited in <cy>Render Settings</c>, not here.",
+			"type": "string",
+			"default": "ffmpeg",
+			"platforms": ["win"]
+		},
 		"macros_folder": {
 			"name": "Macro Save Location",
 			"type": "folder",

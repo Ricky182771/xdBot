@@ -1,5 +1,11 @@
 # v2.4.1
 
+* Added a native FFmpeg render backend for Linux (Wine/Proton), enabling GPU-accelerated
+  encoding such as VAAPI. **If you play through Proton and had an `ffmpeg.exe` configured,
+  renders now go through your system's FFmpeg instead** — turn off *Use Native FFmpeg
+  (Wine/Proton)* in mod settings to get the old behaviour back.
+* The native encoder args and filters are edited from Render Settings, next to the other
+  render arguments.
 * Added Auto Clicker keybind.
 * Fixed spider being buggy if using Input Fixes.
 * Made render extension default to .mp4 if empty.
