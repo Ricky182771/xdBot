@@ -39,6 +39,15 @@ add_library(${PROJECT_NAME} SHARED
     src/practice_fixes/play_layer.cpp
 )
 
+# native_ffmpeg.cpp tiene que incluir <winsock2.h> antes que <windows.h>. Con PCH activo
+# (Geode lo prende cuando usas sccache + Clang, como en CI), el PCH de Geode.hpp se
+# inyecta antes de la línea 1 y mete <windows.h> -> <winsock.h> primero, lo que choca
+# con winsock2 (redefinición de sockaddr, fd_set, IPPROTO_*...). Este archivo va sin PCH.
+set_source_files_properties(src/renderer/native_ffmpeg.cpp PROPERTIES
+    SKIP_PRECOMPILE_HEADERS ON
+    SKIP_UNITY_BUILD_INCLUSION ON
+)
+
 if (NOT DEFINED ENV{GEODE_SDK})
     message(FATAL_ERROR "Unable to find Geode SDK! Please define GEODE_SDK environment variable to point to Geode")
 else()
