@@ -1,0 +1,142 @@
+name: Build xdBot
+
+# Compila el mod para Windows (Win64) y Android (32/64) y los combina en un solo .geode.
+# - push a main / PR: build + artifact descargable
+# - tag vX.Y.Z: build + GitHub Release con el .geode (el tag tiene que coincidir con mod.json)
+# - manual (workflow_dispatch): permite probar otro commit de bindings sin tocar el archivo
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore: ['**.md', 'logo.png', '.gitignore']
+  pull_request:
+    paths-ignore: ['**.md', 'logo.png', '.gitignore']
+  workflow_dispatch:
+    inputs:
+      bindings-ref:
+        description: 'Commit o rama de geode-sdk/bindings (vacío = el fijado en BINDINGS_REF)'
+        required: false
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Bindings fijados: el último commit de geode-sdk/bindings con el que el mod compiló
+  # (GD 2.2081, Geode 5.8.2, agosto 2026). En main renombran miembros (m_unk*) seguido,
+  # y eso rompe PlayerData/practice fixes sin que cambie nada en este repo.
+  # Para actualizar: correr el workflow a mano con el commit nuevo y, si pasa, cambiarlo aquí.
+  BINDINGS_REF: 923f5fc477832435810ade5e041f211882d655d4
+
+jobs:
+  check:
+    name: Check metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      short-sha: ${{ steps.meta.outputs.short-sha }}
+      bindings-ref: ${{ steps.meta.outputs.bindings-ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Read and validate metadata
+        id: meta
+        shell: bash
+        env:
+          INPUT_BINDINGS_REF: ${{ inputs.bindings-ref }}
+        run: |
+          version=$(jq -r .version mod.json)
+          gdr=$(grep -oP 'xdBotVersion = "\Kv?[^"]+' src/gdr/gdr.hpp)
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "short-sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "bindings-ref=${INPUT_BINDINGS_REF:-$BINDINGS_REF}" >> "$GITHUB_OUTPUT"
+
+          # xdBotVersion se guarda dentro de cada macro y sale en la UI: avisar si se quedó atrás
+          if [[ "${gdr#v}" != "$version" ]]; then
+            echo "::warning file=src/gdr/gdr.hpp,line=17::xdBotVersion ($gdr) no coincide con mod.json ($version)"
+          fi
+
+          # Un release con tag que no coincide con mod.json es un error
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "${GITHUB_REF_NAME#v}" != "$version" ]]; then
+            echo "::error::El tag $GITHUB_REF_NAME no coincide con la versión de mod.json ($version)"
+            exit 1
+          fi
+
+          # Todo .cpp en src/ tiene que estar en add_library, si no el linker truena con símbolos faltantes
+          status=0
+          while IFS= read -r f; do
+            if ! grep -qF "$f" CMakeLists.txt; then
+              echo "::error file=$f::No está en la lista de add_library de CMakeLists.txt"
+              status=1
+            fi
+          done < <(find src -name '*.cpp' | sort)
+          exit $status
+
+  build:
+    name: ${{ matrix.name }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            target: Win64
+            config: RelWithDebInfo
+          - name: Android32
+            os: ubuntu-latest
+            target: Android32
+            config: Release
+          - name: Android64
+            os: ubuntu-latest
+            target: Android64
+            config: Release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build the mod
+        # Fijado a commit: el action se actualiza seguido y @main puede cambiar el build sin aviso
+        uses: geode-sdk/build-geode-mod@586d1046506e351d1b366c7ed5e3ae1ed73bd541
+        with:
+          sdk: given                # la versión del campo "geode" de mod.json
+          bindings: geode-sdk/bindings
+          bindings-ref: ${{ needs.check.outputs.bindings-ref }}
+          build-config: ${{ matrix.config }}
+          target: ${{ matrix.target }}
+          export-pdb: true          # PDB de Windows para leer crash logs
+          combine: true
+
+  package:
+    name: Package
+    needs: [check, build]
+    # En push/PR se empaqueta lo que haya compilado aunque falle una plataforma.
+    # En un tag se exige que compilen las tres.
+    if: ${{ !cancelled() && needs.check.result == 'success' && (github.ref_type != 'tag' || needs.build.result == 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Combine builds
+        id: combine
+        uses: geode-sdk/build-geode-mod/combine@586d1046506e351d1b366c7ed5e3ae1ed73bd541
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: xdBot-${{ needs.check.outputs.version }}-${{ needs.check.outputs.short-sha }}
+          path: ${{ steps.combine.outputs.build-output }}
+          if-no-files-found: error
+
+      - name: Publish release
+        if: ${{ github.ref_type == 'tag' }}
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: ${{ steps.combine.outputs.build-output }}/*
+          generate_release_notes: true
